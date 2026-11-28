@@ -273,3 +273,13 @@ describe("recallTranscript over a read set with a legacy sidecar", () => {
     expect(result.stopped).toEqual({ reason: "time", reachedBackTo: null });
   });
 });
+
+describe("default recall budget", () => {
+  it("is bound by time, with the byte cap far past what the time budget can read", async () => {
+    const { RECALL_SCAN_BUDGET } = await import("../src/sessions/store.js");
+    expect(RECALL_SCAN_BUDGET.maxMs).toBe(300);
+    // A transcript that grows a megabyte or two a month must not hit the byte
+    // cap first: 300 ms scans tens of megabytes, so the cap sits well above that.
+    expect(RECALL_SCAN_BUDGET.maxBytes).toBeGreaterThanOrEqual(128 * 1024 * 1024);
+  });
+});

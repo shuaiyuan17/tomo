@@ -167,8 +167,14 @@ export interface RecallScanBudget {
  * The search runs synchronously on the daemon's event loop, so this is how
  * long one `recall_conversation` call may hold up everything else. A direct
  * message transcript of about 30,000 records scans in well under it.
+ *
+ * Time is the real bound. A long-lived transcript grows by a megabyte or two a
+ * month and scans at roughly 5 ms per megabyte, so a byte cap near today's size
+ * would cut every undated search short long before the time budget mattered.
+ * `maxBytes` stays only as a backstop for a pathological disk (one far larger
+ * than the time budget could read), set well past what 300 ms can scan.
  */
-export const RECALL_SCAN_BUDGET: Readonly<RecallScanBudget> = { maxMs: 300, maxBytes: 16 * 1024 * 1024 };
+export const RECALL_SCAN_BUDGET: Readonly<RecallScanBudget> = { maxMs: 300, maxBytes: 256 * 1024 * 1024 };
 const RECALL_CLOCK_EVERY = 64;
 /** How far into a file the scan looks for its first record before deciding
  *  whether `toTime` rules the whole file out. */

@@ -45,7 +45,7 @@ describe("sub-sessions in the Tasks rail", () => {
     const bg = task({ status: "waiting", waitingOn: "external", background: true });
     expect(subsessionState(bg)).toBe("background");
     expect(isWorkingState(subsessionState(bg))).toBe(true);
-    expect(subsessionStateLabel(bg)).toBe("Working (background)");
+    expect(subsessionStateLabel(bg)).toBe("Waiting on background work");
     expect(isWorkingState(subsessionState(task({ status: "waiting", waitingOn: "external" })))).toBe(false);
     // Waiting on the owner is never hidden behind background work.
     expect(subsessionState(task({ status: "waiting", waitingOn: "owner", background: true }))).toBe("waitingOwner");

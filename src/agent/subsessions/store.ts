@@ -457,7 +457,7 @@ export class SubsessionStore {
         return null;
       }
       if (backup.kind === "table") {
-        if (metaValue(db, SUBSESSIONS_IMPORTED_KEY) === backup.digest) return null;
+        if (!exported && metaValue(db, SUBSESSIONS_IMPORTED_KEY) === backup.digest) return null;
         replaceRows(db, stored, this.untrust(backup.table));
         setMeta(db, SUBSESSIONS_IMPORTED_KEY, backup.digest);
         deleteMeta(db, SUBSESSIONS_EXPORTED_KEY);
@@ -494,28 +494,35 @@ export class SubsessionStore {
    * (that throws before here): the files stay as they are for the owner.
    */
   private finishImport(primary: LegacyTable, backup: LegacyTable): void {
-    // The placeholder first, and it must land: until it does, an older Tomo
-    // could still read the old file (or, with that gone, nothing) as its
-    // table. Failing it keeps sub-sessions off this start; the next retries.
+    // Every step must land before this process writes anything: until the
+    // old files are out of the way, an older Tomo started in between must see
+    // exactly what was imported (the file, or the .bak it would recover from
+    // itself), never an empty table nor one this process has moved on from.
+    // A failure keeps sub-sessions off this start; the next start finishes it
+    // (each step is safe to repeat).
     try {
-      if (primary.kind === "table") keepAside(this.path, primary.raw);
-      else if (primary.kind === "bad" && primary.raw) keepCorruptCopy(this.path);
-      if (primary.kind !== "placeholder") writePlaceholder(this.path, subsessionsPlaceholder(this.dbPath));
-    } catch (err) {
-      throw new SubsessionStoreError(`Imported the sub-session table, but could not leave the placeholder at ${this.path}; sub-sessions stay off until it can be written`, err);
-    }
-    // Then the .bak goes aside. Left behind, an older Tomo would recover the
-    // table from it, marked untrusted (never acting on it): not lost, so a
-    // failure here is only logged and retried next start.
-    try {
-      if (backup.kind !== "absent") {
-        if (backup.kind === "table") keepAside(this.backupPath, backup.raw);
-        else keepCorruptCopy(this.backupPath);
-        unlinkSync(this.backupPath);
+      if (primary.kind === "table") {
+        // The file holds what was imported: the .bak can go first.
+        keepAside(this.path, primary.raw);
+        this.moveBackupAside(backup);
+        writePlaceholder(this.path, subsessionsPlaceholder(this.dbPath));
+      } else {
+        // No usable file: an older Tomo would recover from the .bak, so it
+        // goes only once the placeholder (which still sends it there) is in.
+        if (primary.kind === "bad" && primary.raw) keepCorruptCopy(this.path);
+        if (primary.kind !== "placeholder") writePlaceholder(this.path, subsessionsPlaceholder(this.dbPath));
+        this.moveBackupAside(backup);
       }
     } catch (err) {
-      log.warn({ err, file: this.backupPath }, "Could not move the old sub-session table backup aside; will retry next start");
+      throw new SubsessionStoreError(`Imported the sub-session table, but could not put the old files at ${this.path} aside; sub-sessions stay off until that works (the next start retries)`, err);
     }
+  }
+
+  private moveBackupAside(backup: LegacyTable): void {
+    if (backup.kind === "absent") return;
+    if (backup.kind === "table") keepAside(this.backupPath, backup.raw);
+    else keepCorruptCopy(this.backupPath);
+    unlinkSync(this.backupPath);
   }
 
   /** A table read from `.bak` may be missing tasks, and its records may be stale: it says so from here on, in every write. */

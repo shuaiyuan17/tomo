@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportSubsessionsToFile, parseTable, readSubsessionTitles, SUBSESSIONS_EXPORTED_KEY, SubsessionStore, SubsessionStoreError } from "../src/agent/subsessions/store.js";
-import { openTomoDb, sharedTomoDb } from "../src/db/index.js";
+import { openTomoDb, sharedTomoDb, TomoDb } from "../src/db/index.js";
 import { metaValue } from "../src/db/legacy.js";
 import * as fsUtils from "../src/fs-utils.js";
 import { TRANSITION_LOG_KEEP, appendInput, HARNESS } from "../src/agent/subsessions/types.js";
@@ -218,13 +218,48 @@ describe("importing the old subsessions.json", () => {
       return real(file, value, o);
     });
     const store = new SubsessionStore(path);
-    expect(() => store.list()).toThrow(/placeholder/);
+    expect(() => store.list()).toThrow(/aside/);
     expect(store.state()).toBe("unreadable");
     vi.restoreAllMocks();
     expect(JSON.parse(readFileSync(path, "utf8")).tasks).toHaveLength(2);
     const next = new SubsessionStore(path);
     expect(next.list()).toHaveLength(2);
     expect(JSON.parse(readFileSync(path, "utf8")).movedToDatabase).toBeDefined();
+  });
+
+  it("a .bak that cannot be moved aside keeps sub-sessions off this start; an older Tomo would still see only what was imported", () => {
+    const table = legacyTable(2);
+    const text = writeLegacy(table);
+    writeLegacy(table, `${path}.bak`);
+    const real = fsUtils.writeFileAtomicSync;
+    vi.spyOn(fsUtils, "writeFileAtomicSync").mockImplementation((file, content, o) => {
+      if (String(file).includes(".bak.migrated-")) throw new Error("EIO");
+      return real(file, content, o);
+    });
+    expect(() => new SubsessionStore(path).list()).toThrow(/aside/);
+    vi.restoreAllMocks();
+    // The file is still the imported table (the placeholder comes last here).
+    expect(readFileSync(path, "utf8")).toBe(text);
+    const next = new SubsessionStore(path);
+    expect(next.list()).toHaveLength(2);
+    expect(existsSync(`${path}.bak`)).toBe(false);
+    expect(JSON.parse(readFileSync(path, "utf8")).movedToDatabase).toBeDefined();
+  });
+
+  it("with only a .bak imported, the placeholder lands before the .bak goes (an older Tomo would recover the same table itself)", () => {
+    writeLegacy(legacyTable(2), `${path}.bak`);
+    writeFileSync(path, "");
+    const real = fsUtils.writeFileAtomicSync;
+    vi.spyOn(fsUtils, "writeFileAtomicSync").mockImplementation((file, content, o) => {
+      if (String(file).includes(".bak.migrated-")) throw new Error("EIO");
+      return real(file, content, o);
+    });
+    expect(() => new SubsessionStore(path).list()).toThrow(/aside/);
+    vi.restoreAllMocks();
+    expect(JSON.parse(readFileSync(path, "utf8")).movedToDatabase).toBeDefined();
+    expect(existsSync(`${path}.bak`)).toBe(true);
+    expect(new SubsessionStore(path).list()).toHaveLength(2);
+    expect(existsSync(`${path}.bak`)).toBe(false);
   });
 
   it("a .bak left behind (a stop between the placeholder and moving it) is moved aside next start, never imported again", () => {
@@ -365,6 +400,49 @@ describe("the rollback export (tomo db export subsessions)", () => {
     expect(back.list().map((t) => t.id)).toEqual(["s2", "s3"]);
     expect(metaValue(sharedTomoDb(dbPath()), SUBSESSIONS_EXPORTED_KEY)).toBeUndefined();
     expect(back.create({ parentKey: "dm:owner", title: "n", brief: "b" }).id).toBe("s4");
+  });
+
+  it("an export reads the state row and the task rows from one snapshot", () => {
+    const store = new SubsessionStore(path);
+    store.create({ parentKey: "dm:owner", title: "a", brief: "b" });
+    const db = openTomoDb(dbPath());
+    const other = openTomoDb(dbPath());
+    const real = TomoDb.prototype.get;
+    vi.spyOn(TomoDb.prototype, "get").mockImplementation(function (this: TomoDb, sql: string, ...params) {
+      const row = real.call(this, sql, ...params);
+      // Another process creates s2 right after the state row was read.
+      if (this === db && sql.includes("FROM subsessions_state")) {
+        other.transaction(() => {
+          other.run("INSERT INTO subsessions (id, record) SELECT 's2', json_set(json_set(record, '$.id', 's2'), '$.sessionKey', 'task:s2') FROM subsessions WHERE id = 's1'");
+          other.run("UPDATE subsessions_state SET next_id = 3");
+        });
+      }
+      return row;
+    });
+    const out = join(dir, "copy.json");
+    try {
+      exportSubsessionsToFile(db, out, { mark: false });
+    } finally {
+      vi.restoreAllMocks();
+      db.close();
+      other.close();
+    }
+    const copy = JSON.parse(readFileSync(out, "utf8"));
+    expect([copy.nextId, copy.tasks.length]).toEqual([2, 1]);
+  });
+
+  it("after a rollback export a .bak with the bytes imported before is still the truth when the file will not read", () => {
+    const text = writeLegacy(legacyTable(2));
+    const store = new SubsessionStore(path);
+    store.create({ parentKey: "dm:owner", title: "made after the import", brief: "b" });
+    const db = openTomoDb(dbPath());
+    try { exportSubsessionsToFile(db, path, { mark: true }); } finally { db.close(); }
+    writeFileSync(`${path}.bak`, text);
+    writeFileSync(path, "{broken");
+    const back = new SubsessionStore(path);
+    expect(back.list().map((t) => t.id)).toEqual(["s1", "s2"]);
+    expect(back.state()).toBe("recovered");
+    expect(metaValue(sharedTomoDb(dbPath()), SUBSESSIONS_EXPORTED_KEY)).toBeUndefined();
   });
 
   it("an export whose file never landed is undone: the mark goes, the rows stay", () => {

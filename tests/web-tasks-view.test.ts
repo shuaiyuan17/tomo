@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTaskView, modelLabel, runningCount, elapsed, rowElapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind, treeGuides } from "../web/src/tasks.js";
+import { buildTaskView, modelLabel, runningCount, elapsed, rowElapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, railSections, replaceSessionTasks, taskKind, treeGuides } from "../web/src/tasks.js";
 import type { WebSession, WebTask } from "../src/web/protocol.js";
 
 const session = (id: string, title: string, kind: "dm" | "group"): WebSession =>
@@ -14,6 +14,17 @@ describe("task panel view", () => {
     const view = buildTaskView([task("x", { sessionId: "g2" }), task("y", { sessionId: "g1" }), task("z")], sessions, false);
     expect(view.groups.map((g) => g.title)).toEqual(["Owner conversation", "Alpha group", "Zebra group"]);
     expect(buildTaskView([task("q", { sessionId: "unknown" })], sessions, false).groups[0].title).toBe("Conversation");
+  });
+
+  it("lays the rail out with the owner conversation's tasks first, then the sub-sessions, then other conversations", () => {
+    const view = buildTaskView([task("x", { sessionId: "g2" }), task("y", { sessionId: "g1" }), task("z")], sessions, false);
+    const titles = (subsessions: boolean, groups = view.groups) => railSections(groups, subsessions).map((s) => s === "subsessions" ? s : s.title);
+    expect(titles(true)).toEqual(["Owner conversation", "subsessions", "Alpha group", "Zebra group"]);
+    expect(titles(false)).toEqual(["Owner conversation", "Alpha group", "Zebra group"]);
+    // Nothing running in the owner conversation: the sub-sessions lead, still above the groups.
+    expect(titles(true, view.groups.filter((g) => g.kind !== "dm"))).toEqual(["subsessions", "Alpha group", "Zebra group"]);
+    expect(titles(true, [])).toEqual(["subsessions"]);
+    expect(titles(false, [])).toEqual([]);
   });
 
   it("nests by parentTaskId; a missing parent makes a top-level row", () => {

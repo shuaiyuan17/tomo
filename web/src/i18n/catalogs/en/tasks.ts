@@ -28,6 +28,7 @@ export const tasks = {
   command: { heading: "Command", truncated: "\n… (truncated)" },
   subsession: {
     group: "Sub-sessions", openTitle: "Open {{id}} to talk to it",
+    earlier_one: "{{count}} earlier", earlier_other: "{{count}} earlier",
     state: { working: "Working", background: "Working (background)", active: "Active", queued: "Queued", waitingOwner: "Waiting for you", needsYou: "Needs you", waiting: "Waiting", finished: "Done", cancelled: "Cancelled", failed: "Failed" },
     conversation: "Conversation with {{id}}",
     you: "You", tag: { ask: "Question", notify: "Update" }, report: "Report", earlierReport: "Earlier report #{{seq}}",

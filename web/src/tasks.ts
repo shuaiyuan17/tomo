@@ -102,6 +102,15 @@ export function buildTaskView(tasks: WebTask[], sessions: WebSession[], showAmbi
   };
 }
 
+/**
+ * The rail top to bottom: the owner conversation's own tasks, then the
+ * owner's sub-sessions (when there are any), then the tasks of every other
+ * conversation, in the order buildTaskView gave them.
+ */
+export function railSections(groups: readonly TaskGroup[], subsessions: boolean): (TaskGroup | "subsessions")[] {
+  return [...groups.filter((group) => group.kind === "dm"), ...(subsessions ? ["subsessions" as const] : []), ...groups.filter((group) => group.kind !== "dm")];
+}
+
 function tree(list: WebTask[]): TaskRow[] {
   const ids = new Set(list.map((task) => task.taskId));
   const children = new Map<string, WebTask[]>();

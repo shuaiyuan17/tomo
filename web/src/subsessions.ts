@@ -116,6 +116,41 @@ export function isOpenSubsession(task: Pick<WebSubsession, "status" | "ownerActi
   return task.status === "queued" || task.status === "active" || task.status === "waiting" || (task.status === "finished" && !!task.ownerAction);
 }
 
+/** When a task last did anything: its last activity, or its end if that is later. */
+function lastActive(task: Pick<WebSubsession, "lastActivityAt" | "endedAt">): number {
+  return task.endedAt !== undefined && task.endedAt > task.lastActivityAt ? task.endedAt : task.lastActivityAt;
+}
+/** Midnight that began the day `at` falls on, on the viewer's clock (the browser's time zone). */
+export function startOfLocalDay(at: number): number {
+  return new Date(at).setHours(0, 0, 0, 0);
+}
+/**
+ * The sub-sessions the rail lists, in the order given: every open one (and a
+ * finished one that still needs the owner), whatever day it is from, and the
+ * ended ones last active today. An ended one from before today is `earlier`:
+ * folded away until the owner asks for it. A time that cannot be read is not
+ * taken for an old one.
+ */
+type DatedTask = Pick<WebSubsession, "status" | "ownerAction" | "lastActivityAt" | "endedAt">;
+export function todaysSubsessions<T extends DatedTask>(tasks: readonly T[], now: number): { shown: T[]; earlier: T[] } {
+  const today = startOfLocalDay(now);
+  const isEarlier = (task: T) => !isOpenSubsession(task) && lastActive(task) < today;
+  return { shown: tasks.filter((task) => !isEarlier(task)), earlier: tasks.filter(isEarlier) };
+}
+/** How often the rail looks at the clock for a new day. */
+const TODAY_CHECK_MS = 60_000;
+/** Today's first moment on the viewer's clock, moving on when the day does (a page left open overnight, a laptop woken). */
+export function useToday(): number {
+  const [today, setToday] = useState(() => startOfLocalDay(Date.now()));
+  useEffect(() => {
+    const check = () => setToday(startOfLocalDay(Date.now()));
+    const timer = setInterval(check, TODAY_CHECK_MS);
+    document.addEventListener("visibilitychange", check);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", check); };
+  }, []);
+  return today;
+}
+
 /** Sub-sessions that count as activity on the Tasks button: those running now, in a turn or in the background. */
 export function activeSubsessions(tasks: readonly WebSubsession[]): number {
   return tasks.filter((task) => task.status === "active" || (task.status === "waiting" && task.background === true)).length;

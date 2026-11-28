@@ -101,6 +101,7 @@ describe("memory-store guard: Bash", () => {
     "printf x > memory/trip\\ notes.md",
     "rm 2>&1 memory/note.md",
     "cat <<'EOF' > /tmp/x.sh\nrm memory/old.md\nEOF\nrm memory/after.md",
+    'grep -q foo <<< "$text"\necho x >> memory/note.md',
   ])("refuses %j", (command) => {
     expect(bash(command)).toBe(true);
   });

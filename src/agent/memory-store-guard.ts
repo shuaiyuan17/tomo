@@ -143,7 +143,8 @@ export function withoutHeredocBodies(command: string): string {
       continue;
     }
     out.push(line);
-    const m = /<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][\w-]*))/.exec(line);
+    // `<<<` is a here-string (one word of input), not a heredoc.
+    const m = /(?<!<)<<(?!<)(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][\w-]*))/.exec(line);
     if (m) end = { word: m[2] ?? m[3] ?? m[4], tabs: m[1] === "-" };
   }
   return out.join("\n");

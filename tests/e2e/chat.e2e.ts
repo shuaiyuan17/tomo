@@ -697,12 +697,12 @@ it("motion: only what is new rises in (never the history, on load or reload); do
     return value as T;
   };
   expect(await firstConnected(() => calm.evaluate((el) => {
-    const wrapper = el.closest("[data-slot=message-entrance]");
+    const wrapper = el.isConnected ? el.closest("[data-slot=message-entrance]") : null;
     return wrapper ? getComputedStyle(wrapper).animationName : "detached" as const;
   }))).toBe("none");
   await browserExpect(dots).toBeVisible();
   expect(await firstConnected(() => dots.evaluate((el) => {
-    const dot = el.querySelector("i");
+    const dot = el.isConnected ? el.querySelector("i") : null;
     return dot ? [getComputedStyle(el).animationName, getComputedStyle(dot).animationName] : "detached" as const;
   }))).toEqual(["none", "none"]);
   answer("A calm reply.");

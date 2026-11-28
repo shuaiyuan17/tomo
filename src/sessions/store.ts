@@ -923,6 +923,13 @@ export class SessionStore {
     };
   }
 
+  /** Bytes on disk of every file `recallTranscript` would read for `key`
+   *  (zero for one it cannot stat): how a search across several transcripts
+   *  shares out its budget. */
+  transcriptBytes(key: string): number {
+    return this.transcriptReadSet(key).files.reduce((sum, file) => sum + safeFileSize(file.path), 0);
+  }
+
   /** Search archive files (compacted SDK events) for a given session ID */
   searchArchive(sdkSessionId: string, opts: {
     query?: string;

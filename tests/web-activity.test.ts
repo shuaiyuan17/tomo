@@ -17,6 +17,7 @@ import { buildPetTools } from "../src/mcp/pet-tools.js";
 import { PetStore } from "../src/mcp/pet-store.js";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
 import type { SubagentItem } from "../src/web/protocol.js";
+import { webSessionId } from "../src/web/owner.js";
 
 const ROOT = mkdtempSync(join(tmpdir(), "tomo-test-activity-"));
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
@@ -129,7 +130,9 @@ describe("toolActivity reads the raw input", () => {
   });
   it("send_message: MEDIA lines become file names, never paths", () => {
     const activity = toolActivity(I("send_message"), { target: "dm:owner", mode: "direct", message: "Here it is\nMEDIA:/Users/me/out/chart.png" });
-    expect(activity).toMatchObject({ kind: "send_message", mode: "direct", text: "Here it is", media: ["chart.png"] });
+    expect(activity).toMatchObject({ kind: "send_message", mode: "direct", text: "Here it is", media: ["chart.png"], toOwner: true });
+    expect(toolActivity(I("send_message"), { target: "telegram:-2", message: "hi" })).toMatchObject({ mode: "delegate", targetId: webSessionId("telegram:-2") });
+    expect(toolActivity(I("send_message"), { target: "owner", message: "hi" })).toMatchObject({ toOwner: true });
   });
   it("scrubs a secret in a text field", () => {
     const activity = toolActivity(I("task_message"), { id: "s1", text: "use sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH" });

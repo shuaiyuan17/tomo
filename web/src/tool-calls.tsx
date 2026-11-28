@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import { ArrowUpRightIcon, BotIcon, BrainIcon, CircleCheckIcon, CircleDotIcon, CircleIcon, FilePenLineIcon, FileTextIcon, GlobeIcon, ImageIcon,
   LayersIcon, ListTodoIcon, MessageSquareTextIcon, SearchIcon, TerminalIcon, WrenchIcon, type LucideIcon } from "lucide-react";
 import type { TodoEntry, WebSource } from "../../src/web/protocol.js";
@@ -12,6 +11,9 @@ import { callDuration, elapsedSince, groupDuration, groupLabel, groupStart, todo
   type ViewBlock } from "./subagent.js";
 import { useTranslation } from "./i18n/index.js";
 import { activityIcon, activityLine } from "./activity.js";
+import { RunningMark } from "./running-mark.js";
+import { useNow } from "./use-now.js";
+import { ActivityCard } from "./activity-card.js";
 
 /**
  * What the agent does in a turn, as the task view and the main chat both
@@ -45,29 +47,7 @@ const useResultLabel = (name: string, isError: boolean) => {
 /** A tool's trace icon; the Tasks panel marks its subagent and shell tasks with the same ones. */
 export const toolIcon = (name: string) => TOOL_ICONS[name] ?? WrenchIcon;
 
-/**
- * In front of a running step: Tomo's own ring, drawing itself. The accent
- * colour and the motion both say "working"; with reduced motion it is the
- * still ring, and the title still shimmers.
- */
-const MARK_PATH = "M 32 14 C 36 20, 32 32, 20 32 C 8 32, 5 22, 10 14 C 14 7, 26 6, 30 12";
-export function RunningMark() {
-  return <svg viewBox="0 0 40 40" aria-hidden="true" data-slot="running-mark" className="fill-none stroke-primary [stroke-linecap:round] [stroke-width:4.5]">
-    {/* A faint ring is always there, so the mark never blinks out between passes. */}
-    <path d={MARK_PATH} className="opacity-25" />
-    <path pathLength={100} d={MARK_PATH} className="animate-mark [stroke-dasharray:100] motion-reduce:hidden" /></svg>;
-}
-/** A clock that ticks once a second while `active`. */
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(timer);
-  }, [active]);
-  return now;
-}
+export { RunningMark } from "./running-mark.js";
 
 /** Said to a screen reader after the title: the state the colour or shimmer shows. */
 function StateText({ status }: { status?: TraceStatus }) {
@@ -230,7 +210,7 @@ export function Sources({ sources, open, onOpenChange }: { sources: WebSource[];
 /** A page without a title: its URL without the scheme. */
 const shortUrl = (url: string) => url.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, "");
 
-export type TurnStep = Extract<ViewBlock, { kind: "tool" | "group" | "thinking" | "todos" | "sources" }>;
+export type TurnStep = Extract<ViewBlock, { kind: "tool" | "group" | "thinking" | "todos" | "sources" | "card" }>;
 
 /**
  * One step block of a turn, with its open/closed state: `choices` holds the
@@ -246,6 +226,9 @@ export function TurnBlock({ block, running, choices, onChoice }:
       onOpenChange={(value) => onChoice(block.key, value)} />;
     case "todos": return <TodoList row={block.row} running={running} open={choices[block.key] ?? running} onOpenChange={(value) => onChoice(block.key, value)} />;
     case "sources": return <Sources sources={block.sources} open={choices[block.key] ?? false} onOpenChange={(value) => onChoice(block.key, value)} />;
+    // A card's raw-data panel is kept open by its call (`raw:<id>`), so paging and live updates do not close it.
+    case "card": return <ActivityCard rows={block.rows} running={running} rawOpen={choices[`raw:${block.rows[0].toolUseId}`] ?? false}
+      onRawOpen={(value) => onChoice(`raw:${block.rows[0].toolUseId}`, value)} />;
   }
 }
 

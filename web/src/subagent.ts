@@ -2,7 +2,7 @@ import type { SubagentItem, SubagentPage, TodoEntry, ToolActivity, ToolOutcome, 
 import { safeHref } from "./links.js";
 import { i18n } from "./i18n/index.js";
 import { formatUnit, formatUnitPair } from "./i18n/format.js";
-import { activityKind, activityKindText, activityLine } from "./activity.js";
+import { activityKind, activityKindText, activityLine, isCardRow } from "./activity.js";
 
 /** Pure state for the read-only subagent view, kept out of React so it is testable. */
 
@@ -256,6 +256,8 @@ export type ViewBlock =
   | { kind: "thinking"; row: ThinkingRow }
   | { kind: "tool"; row: ToolRow }
   | { kind: "group"; key: string; tools: ToolRow[]; steps: Array<ToolRow | ThinkingRow> }
+  /** One of Tomo's own calls that left something behind (activity-card.tsx): never folded, it splits a run like text does. */
+  | { kind: "card"; key: string; rows: ToolRow[] }
   | { kind: "todos"; key: string; row: TodosRow }
   | { kind: "sources"; key: string; sources: WebSource[] };
 
@@ -284,7 +286,11 @@ export function groupRows(rows: ViewRow[]): ViewBlock[] {
     turn = { todos: [], tools: [], afterTools: 0 };
   };
   for (const row of rows) {
-    if (row.kind === "tool" || row.kind === "thinking") {
+    if (row.kind === "tool" && isCardRow(row)) {
+      flush();
+      blocks.push({ kind: "card", key: `card:${row.toolUseId}`, rows: [row] });
+      turn.tools.push(row);
+    } else if (row.kind === "tool" || row.kind === "thinking") {
       run.push(row);
       if (row.kind === "tool") turn.tools.push(row);
     } else if (row.kind === "todos") {

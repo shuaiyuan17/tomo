@@ -47,6 +47,14 @@ const KINDS: Record<ToolActivity["kind"], { icon: LucideIcon; kind: ActivityKind
   lcm_rollup: { icon: LayersIcon, kind: "rollup" }, upsert_person: { icon: UserRoundIcon, kind: "people" },
 };
 
+/** Tools shown as a card in the chat (activity-card.tsx); every other internal tool is a line. */
+const CARD_KINDS = new Set<ToolActivity["kind"]>(["task_spawn", "task_message", "task_cancel", "send_message"]);
+/** A row shown as a card: one of those tools, with an activity this page knows (and a result it could read, when it has one). */
+export function isCardRow(row: Pick<ToolRow, "activity" | "result">): boolean {
+  const activity = knownActivity(row);
+  return !!activity && CARD_KINDS.has(activity.kind);
+}
+
 export function activityIcon(row: Pick<ToolRow, "activity" | "result">): LucideIcon | undefined {
   const activity = knownActivity(row);
   return activity ? KINDS[activity.kind].icon : undefined;

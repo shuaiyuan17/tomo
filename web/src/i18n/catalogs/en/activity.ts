@@ -1,5 +1,22 @@
 /** Tomo's own tools (tomo-internal) in the chat: one-line sentences, fold summaries and (later) activity cards. */
 export const activity = {
+  card: {
+    raw: "Raw data", rawHide: "Hide raw data", copyJson: "Copy JSON", copyId: "Copy call ID: {{id}}",
+    rawNote: "As the server sends it: clipped at 4,000 characters, secrets masked. The transcript on disk has the rest.",
+    showAll: "Show all", showLess: "Show less", longer: "The message is longer; the raw data has more.",
+    spawn: "Started a task", spawning: "Starting a task", spawnFailed: "Couldn't start the task",
+    openTask: "Open task", taskGone: "No longer in the task list",
+    note: "Passed a note to <id>{{id}}</id>", noting: "Passing a note to <id>{{id}}</id>", noteFailed: "Couldn't pass the note to <id>{{id}}</id>",
+    noteHeld: "Note to <id>{{id}}</id> held", noteQueued: "It gets this with its first turn.", noteReleased: "This lifted its pause.",
+    withOwner: "With your own message attached",
+    cancel: "Cancelled a task", cancelling: "Cancelling a task", cancelFailed: "Couldn't cancel <id>{{id}}</id>", reason: "Reason: {{reason}}",
+    sentTo: "Sent to <b>{{name}}</b>", sendingTo: "Sending to <b>{{name}}</b>", sendFailed: "Couldn't send to <b>{{name}}</b>",
+    sentYou: "Sent you a message", sendingYou: "Sending you a message", sentHere: "Sent to this conversation",
+    delegate: "Asked <b>{{name}}</b> to write one", delegateYou: "Asked your conversation to write to you", delegating: "Asking <b>{{name}}</b> to write one",
+    delegateNote: "The words are written over there; this is what it was asked.",
+    replyTo: "Reply to “{{text}}”", effect: "Effect: {{effect}}",
+    via: { telegram: "Telegram", imessage: "iMessage", web: "Web" },
+  },
   line: {
     taskSpawn: "Started a task · {{title}}", taskSpawnId: "Started {{id}} · {{title}}",
     taskMessage: "Passed a note to {{id}}", taskMessageHeld: "Held a note for {{id}}",

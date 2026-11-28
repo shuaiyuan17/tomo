@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { defaultPeopleDirs, loadPeople, renderPeopleRoster } from "../people.js";
 import { PRIVATE_MEMORY_SUBDIR, isPrivateIndexLine } from "./private-memory.js";
+import { MEMORY_HISTORY_DAYS } from "../memory/history.js";
 import {
   collectMemoryFiles,
   MEMORY_FILES_HEADER,
@@ -210,8 +211,8 @@ A correction should spare the owner from correcting you again. Change the line w
     ? `When someone asks you to forget something, remove it from this chat's memory folder and say what you removed.`
     : shared
       // The shared variant has no private core in its prompt, so no Don't keep list to check against.
-      ? `private/MEMORY.md is not loaded now, and with it its \`## Don't keep\` list of subjects the owner asked you to forget. On the owner's own turn, read that list with memory_read before you save anything personal; on a group member's turn, save nothing personal about the owner. When asked to forget something, remove what you can reach, say what you removed, and ask the owner to repeat it in private so the subject goes on that list.`
-      : `When the owner asks you to forget something, remove it, add its subject in a few neutral words under \`## Don't keep\` in private/MEMORY.md, and say exactly what you removed: the conversation history still holds the original words. Don't save anything on a subject listed there.`;
+      ? `private/MEMORY.md is not loaded now, and with it its \`## Don't keep\` list of subjects the owner asked you to forget. On the owner's own turn, read that list with memory_read before you save anything personal, and when they ask you to forget something, handle it as in private: remove it and add its subject to that list. On a group member's turn, save nothing personal about the owner, and when asked to forget something, remove what you can reach, say what you removed, and ask the owner to repeat it in private so the subject goes on that list.`
+      : `When the owner asks you to forget something, remove it, add its subject in a few neutral words under \`## Don't keep\` in private/MEMORY.md (that section goes at the top of the file: add it there if it is missing), and say exactly what you removed: the conversation history still holds the original words, and the memory tools keep what they replace or delete for ${MEMORY_HISTORY_DAYS} days in Tomo's own data. Don't save anything on a subject listed there.`;
 
   const instructions = `
 # MEMORY — Your Persistent Memory
@@ -230,7 +231,7 @@ Write memory only with the memory tools: memory_list, memory_read, memory_search
 
 ${saving}
 - Search before you add (memory_search), and update an existing line rather than adding a second one.
-- When something changes (booked, cancelled, done, moved), find the entries that say otherwise and fix them where they live. Remove what is no longer true.
+- When something changes (booked, cancelled, done, moved), find the entries that say otherwise and fix them where they live${isGroup ? " (in this chat's memory folder; anywhere else, say what changed, for the owner to fix in private)" : ""}. Remove what is no longer true.
 - Convert relative dates to absolute ones: "next Friday" is stored as its date.
 
 ## Provenance

@@ -103,10 +103,21 @@ export function parseDescription(text: string): string | undefined {
   return undefined;
 }
 
+/** The frontmatter block's text, or "" when there is none. */
+function frontmatterOf(text: string): string {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") return "";
+  const close = lines.findIndex((line, i) => i > 0 && line.trim() === "---");
+  return close === -1 ? "" : lines.slice(1, close).join("\n");
+}
+
 /** What is wrong with a file's description, or null when it has a usable one. */
-export function descriptionProblem(text: string): "missing" | "too-long" | null {
+export function descriptionProblem(text: string): "missing" | "multi-line" | "too-long" | null {
   const d = parseDescription(text);
   if (d === undefined) return "missing";
+  // The tools take a one-line description only: a YAML block (`>`, `|`) can
+  // run past what this parser reads, and past the limit with it.
+  if (/^description\s*:\s*[>|]/m.test(frontmatterOf(text))) return "multi-line";
   return Array.from(d).length > DESCRIPTION_MAX_CHARS ? "too-long" : null;
 }
 

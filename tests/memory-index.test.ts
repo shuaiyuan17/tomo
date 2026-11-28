@@ -19,6 +19,11 @@ describe("parseDescription", () => {
     expect(parseDescription(text)).toBe(want);
   });
 
+  it("takes a one-line description only", () => {
+    expect(descriptionProblem(`---\ndescription: >\n  ${"a".repeat(150)}\n\n  ${"b".repeat(150)}\n---\n`)).toBe("multi-line");
+    expect(descriptionProblem("---\ndescription: one line\n---\n")).toBeNull();
+  });
+
   it("counts characters, not bytes, against the 200 limit", () => {
     expect(descriptionProblem(`---\ndescription: ${"旅".repeat(200)}\n---\n`)).toBeNull();
     expect(descriptionProblem(`---\ndescription: ${"旅".repeat(201)}\n---\n`)).toBe("too-long");

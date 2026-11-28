@@ -2,7 +2,7 @@
 // against the conversation (§6.3 of the memory design), and the two cores'
 // sizes. Synchronous and bounded: it runs in the rollup runner, on the
 // daemon's event loop, right before the nudge is sent.
-import { readFileSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { isoWeekTag } from "../lcm/blocks.js";
 import {
@@ -111,19 +111,30 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
   return { lines, more, truncated: topics.truncated };
 }
 
-/** A core's size the way the prompt measures it (trimmed, then split), or null when it doesn't exist or can't be read. */
-function coreSize(abs: string): { lines: number; bytes: number } | null {
-  let raw: string;
-  try { raw = readFileSync(abs, "utf8"); } catch { return null; }
-  const trimmed = raw.trim();
+/**
+ * A core's size the way the prompt measures it (trimmed, then split): read
+ * like every memory file (no links, regular files only, nonblocking) and only
+ * up to the read bound. Null when it doesn't exist or can't be read; `over`
+ * when it is past the bound.
+ */
+function coreSize(root: string, rel: string): { lines: number; bytes: number } | "over" | null {
+  let read: ReturnType<typeof readMemoryFile>;
+  try { read = readMemoryFile(join(root, rel), root, false, undefined, SAID_READ_MAX_BYTES); } catch { return null; }
+  if (read === null || "refused" in read) return null;
+  if (read.partial) return "over";
+  const trimmed = read.bytes.toString("utf8").trim();
   return trimmed ? { lines: trimmed.split("\n").length, bytes: Buffer.byteLength(trimmed, "utf8") } : { lines: 0, bytes: 0 };
 }
 
 /** One sentence: both cores' sizes against their soft budget (the weekly upkeep's `coreStatus`). */
 export function coreStatusLine(memoryDir: string): string {
-  const one = (file: string, abs: string): string => {
-    const s = coreSize(abs);
-    return s === null ? `${file} doesn't exist yet` : `${file} is ${s.lines} lines / ${(s.bytes / 1024).toFixed(1)} KB`;
+  let root: string | undefined;
+  try { root = realpathSync(memoryDir); } catch { root = undefined; }
+  const one = (file: string): string => {
+    const s = root === undefined ? null : coreSize(root, file);
+    if (s === null) return `${file} doesn't exist yet or can't be read`;
+    if (s === "over") return `${file} is over ${SAID_READ_MAX_BYTES / 1024} KB`;
+    return `${file} is ${s.lines} lines / ${(s.bytes / 1024).toFixed(1)} KB`;
   };
-  return `${one("private/MEMORY.md", join(memoryDir, "private", "MEMORY.md"))} and ${one("MEMORY.md", join(memoryDir, "MEMORY.md"))} (budget ${MEMORY_SOFT_LINES} lines or ${MEMORY_SOFT_KB} KB each).`;
+  return `${one("private/MEMORY.md")} and ${one("MEMORY.md")} (budget ${MEMORY_SOFT_LINES} lines or ${MEMORY_SOFT_KB} KB each).`;
 }

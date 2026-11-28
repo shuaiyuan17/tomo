@@ -3057,6 +3057,10 @@ export class Agent {
     }
 
     const key = sessionKey;
+    if (options.dropIf?.()) {
+      log.info({ sessionKey }, "Background turn dropped at run time (its prompt no longer fits the session)");
+      return false;
+    }
     const delivery = options.deliveryTarget
       ? this.channelDeliveryTarget(options.deliveryTarget, sessionKey, "Cron")
       : this.resolveDeliveryTargetForSession(sessionKey, "Cron");

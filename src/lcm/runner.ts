@@ -121,9 +121,14 @@ export function weeklyMemoryUpkeepText(period: string, pass: Exclude<MemoryPass,
   ].join("\n");
 }
 
+/** The levels with a memory step: daily (the pass) and weekly (the upkeep). */
+function isMemoryStepLevel(p: DuePromotion): boolean {
+  return p.level === "daily" || p.level === "weekly";
+}
+
 /** The memory step's lines for this nudge, or none. */
 function memoryStepLines(p: DuePromotion, pass: MemoryPass | undefined): string[] {
-  if (!pass || (p.level !== "daily" && p.level !== "weekly")) return [];
+  if (!pass || !isMemoryStepLevel(p)) return [];
   if (pass.skip !== undefined) {
     return [`No memory ${p.level === "daily" ? "pass" : "upkeep"} this time: ${pass.skip}. Write the rollup only, and end its summary with one line: \`memory: skipped (${pass.skip})\`.`, ""];
   }
@@ -237,13 +242,15 @@ export function buildMemoryPass(p: DuePromotion, sessionKey: string, deps: Memor
 }
 
 function memoryPassFor(p: DuePromotion, sessionKey: string, deps: MemoryPassDeps): MemoryPass | undefined {
-  if (sessionKind(sessionKey) !== "owner-dm" || (p.level !== "daily" && p.level !== "weekly")) return undefined;
+  if (sessionKind(sessionKey) !== "owner-dm" || !isMemoryStepLevel(p)) return undefined;
   const today = localDateTag((deps.now ?? (() => new Date()))());
   let room: number | undefined;
   try {
     const usage = deps.contextUsage?.(sessionKey);
     if (usage && usage.max > 0) {
-      const pct = deps.forceCompactAtPct?.() ?? 95;
+      // Forced compaction off (0 or 100): the line is the window itself.
+      const raw = deps.forceCompactAtPct?.() ?? 95;
+      const pct = raw > 0 && raw < 100 ? raw : 100;
       room = Math.floor((usage.max * pct) / 100) - usage.used;
     }
   } catch (err) {
@@ -294,6 +301,12 @@ export class RollupRunner {
   private checking = false;
   /** What the memory step of a DM nudge reads (the memory root, the session's context usage). */
   private memory: MemoryPassDeps;
+  /**
+   * Cooldown keys whose last nudge carried a memory step and did not
+   * complete: the next one for that period goes without the step. In memory
+   * only: after a restart the step is tried once more.
+   */
+  private memoryStepFailed = new Set<string>();
 
   constructor(agent: Agent, cooldowns?: NudgeCooldownStore, memory?: Partial<MemoryPassDeps>) {
     this.agent = agent;
@@ -433,15 +446,31 @@ export class RollupRunner {
         // The memory step (owner DM, daily and weekly only) is built before
         // the cooldown is armed and cannot throw: a failed scan sends the
         // nudge with less of the step, never no nudge.
-        const memoryPass = buildMemoryPass(next, sessionKey, this.memory);
         cooldownKey = `${sessionKey}:${next.level}:${next.period}`;
+        // A period whose last nudge with a memory step did not complete is
+        // asked again without the step: whatever the step ran into (a turn
+        // limit, an error, a window gone full), the rollup is not held
+        // behind it twice. A rollup-only retry that succeeds clears the mark.
+        const retryWithoutStep = this.memoryStepFailed.has(cooldownKey);
+        const memoryPass = retryWithoutStep
+          ? (isMemoryStepLevel(next) && sessionKind(sessionKey) === "owner-dm" ? { skip: "the last attempt at this rollup did not finish" } : undefined)
+          : buildMemoryPass(next, sessionKey, this.memory);
+        const hasStep = memoryPass !== undefined && memoryPass.skip === undefined;
         this.lastNudged.set(cooldownKey, now);
+        // The nudge waits its place in the session's queue. A group summoned
+        // in meanwhile turns the session shared; one that carries the memory
+        // step (private lines, private context to read) is dropped then,
+        // like a nudge never sent: no cooldown, asked again after the summon.
+        let droppedForSummon = false;
         const delivered = await this.agent.handleCronMessage(
           nudgeText(next, sdkSessionId, sessionKey, memoryPass), sessionKey, {
             showTyping: false,
             suppressDelivery: true,
+            ...(hasStep ? { dropIf: () => (droppedForSummon = this.agent.hasActiveSummonInto(sessionKey)) } : {}),
           },
         );
+        if (delivered) this.memoryStepFailed.delete(cooldownKey);
+        else if (hasStep && !droppedForSummon) this.memoryStepFailed.add(cooldownKey);
         // handleCronMessage resolves FALSE rather than rejecting when the turn
         // never happened (no deliverable target for the session, the turn
         // ended on an error result, the per-session queue threw). Holding a 6h

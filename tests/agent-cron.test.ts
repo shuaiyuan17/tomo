@@ -36,6 +36,24 @@ installAgentTestHooks();
 // ===== Cron delivery =====
 
 describe("cron message delivery", () => {
+  it("drops a turn whose dropIf says so when it is about to run, without running it", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await seedSession(agent, tg);
+    let ran = 0;
+    mockSdk.responseFn = () => { ran++; return "NO_REPLY"; };
+
+    let asked = 0;
+    await expect(agent.handleCronMessage("Rollup", "telegram:12345", { dropIf: () => { asked++; return true; } })).resolves.toBe(false);
+    expect(asked).toBe(1);
+    expect(ran).toBe(0);
+
+    await expect(agent.handleCronMessage("Rollup", "telegram:12345", { dropIf: () => false })).resolves.toBe(true);
+    expect(ran).toBe(1);
+    await agent.stop();
+  });
+
   it("reports the turn's outcome to the caller (CronScheduler.markRun)", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");

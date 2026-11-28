@@ -2,6 +2,7 @@
  * The weekly `said` check's list (§6.3 of the memory design): the harness, not
  * the model, picks which lines get checked against the conversation.
  */
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -109,6 +110,20 @@ describe("collectSaidLines", () => {
 describe("coreStatusLine", () => {
   it("gives both cores' sizes against the budget, and says when one doesn't exist", () => {
     put("MEMORY.md", "## Owner\n- one\n");
-    expect(coreStatusLine(dir)).toBe("private/MEMORY.md doesn't exist yet and MEMORY.md is 2 lines / 0.0 KB (budget 200 lines or 16 KB each).");
+    expect(coreStatusLine(dir)).toBe("private/MEMORY.md doesn't exist yet or can't be read and MEMORY.md is 2 lines / 0.0 KB (budget 200 lines or 16 KB each).");
+  });
+});
+
+describe("reads that cannot hold the event loop", () => {
+  it("a core that is a FIFO is neither read nor waited on", () => {
+    mkdirSync(join(dir, "private"), { recursive: true });
+    execFileSync("mkfifo", [join(dir, "MEMORY.md")]);
+    expect(coreStatusLine(dir)).toContain("MEMORY.md doesn't exist yet or can't be read (budget");
+    expect(collectSaidLines(dir, WEEK).lines).toEqual([]);
+  });
+
+  it("a core past the read bound is reported as over it", () => {
+    put("MEMORY.md", "z".repeat(300 * 1024));
+    expect(coreStatusLine(dir)).toContain("MEMORY.md is over 256 KB");
   });
 });

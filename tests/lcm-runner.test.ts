@@ -42,9 +42,9 @@ vi.mock("../src/lcm/blocks.js", async (importOriginal) => ({
 const { RollupRunner } = await import("../src/lcm/runner.js");
 const { NudgeCooldownStore } = await import("../src/lcm/nudge-cooldown-store.js");
 
-interface Nudge { text: string; sessionKey: string; options: { suppressDelivery?: boolean } }
+interface Nudge { text: string; sessionKey: string; options: { suppressDelivery?: boolean; dropIf?: () => boolean } }
 
-function runnerFor(sessionKey: string, summoned: () => boolean = () => false, memory?: ConstructorParameters<typeof RollupRunner>[2]): {
+function runnerFor(sessionKey: string, summoned: () => boolean = () => false, memory?: ConstructorParameters<typeof RollupRunner>[2], turnOk: () => boolean = () => true): {
   runner: InstanceType<typeof RollupRunner>;
   nudges: Nudge[];
   cooldowns: InstanceType<typeof NudgeCooldownStore>;
@@ -56,7 +56,9 @@ function runnerFor(sessionKey: string, summoned: () => boolean = () => false, me
     hasActiveSummonInto: (key: string) => key === sessionKey && summoned(),
     handleCronMessage: async (text: string, key: string, options: Nudge["options"]) => {
       nudges.push({ text, sessionKey: key, options });
-      return true;
+      // As the agent does: asked when the turn is about to run.
+      if (options.dropIf?.()) return false;
+      return turnOk();
     },
   };
   // In-memory cooldown (null path): these cases nudge the same period, and
@@ -270,6 +272,54 @@ describe("the memory step never costs the rollup (§4.2)", () => {
     await checkAll(tiny.runner);
     expect(tiny.nudges[0].text).toContain("`memory: skipped (a turn here has too few tool rounds)`");
     expect(tiny.nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1");
+  });
+
+  it("a nudge with the step is dropped when a group was summoned in while it waited, and asked again later with the step", async () => {
+    let summonedAtRun = false;
+    // The summon starts between the check (which saw none) and the turn.
+    const late = runnerFor("dm:owner", () => summonedAtRun, { memoryDir: () => memDir });
+    const original = late.nudges.push.bind(late.nudges);
+    late.nudges.push = (...items: Nudge[]) => { summonedAtRun = true; return original(...items); };
+    await checkAll(late.runner);
+    expect(late.nudges).toHaveLength(1);
+    // Not delivered: no cooldown, so the first tick after the summon asks again...
+    expect(late.cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeUndefined();
+    summonedAtRun = false;
+    late.nudges.push = original;
+    await checkAll(late.runner);
+    // ...with the step still in it: a summon is not the step's failure.
+    expect(late.nudges[1].text).toContain("No calls before 9.");
+  });
+
+  it("a nudge without the step is never dropped at run time", async () => {
+    const { runner, nudges } = runnerFor("telegram:-1001234567", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges[0].options.dropIf).toBeUndefined();
+  });
+
+  it("after a nudge with the step fails, the period is asked again without it, then with it once a rollup lands", async () => {
+    let ok = false;
+    const { runner, nudges, cooldowns } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir }, () => ok);
+    await checkAll(runner);
+    expect(nudges[0].text).toContain("No calls before 9.");
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeUndefined();
+    ok = true;
+    await checkAll(runner);
+    expect(nudges[1].text).toContain("`memory: skipped (the last attempt at this rollup did not finish)`");
+    expect(nudges[1].text).not.toContain("No calls before 9.");
+    expect(nudges[1].text).toContain("tomo lcm weekly --session-id sdk-session-1 --week 2026-W34");
+    // That one landed: a later nudge for the period (a rebuild) has the step again.
+    cooldowns.clear("dm:owner:weekly:2026-W34");
+    await checkAll(runner);
+    expect(nudges[2].text).toContain("No calls before 9.");
+  });
+
+  it("with forced compaction off (0 or 100), room is measured to the window, not to zero", async () => {
+    for (const pct of [0, 100]) {
+      const { runner, nudges } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => ({ used: 100_000, max: 1_000_000 }), forceCompactAtPct: () => pct });
+      await checkAll(runner);
+      expect(nudges[0].text).toContain("No calls before 9.");
+    }
   });
 
   it("a group session's nudge has no memory step and no said lines", async () => {

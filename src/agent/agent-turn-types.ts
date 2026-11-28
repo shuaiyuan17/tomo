@@ -59,6 +59,13 @@ export interface UserTurnRequest {
 export interface CronTurnOptions {
   /** False for silent housekeeping turns such as LCM rollups. */
   showTyping?: boolean;
+  /**
+   * Asked when the turn is about to run (after it waited its place in the
+   * queue): true drops it, and the call resolves false. For a prompt built
+   * for a state that may have changed while it waited: a rollup nudge with
+   * private memory lines in it, and a group summoned into the session since.
+   */
+  dropIf?: () => boolean;
   /** This turn restates a reply that was dropped as a thinking block; it
    *  must not request another restate whatever it ends on. */
   restate?: boolean;
